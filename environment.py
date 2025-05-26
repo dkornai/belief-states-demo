@@ -1,21 +1,96 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+def onehot(size, index) -> np.ndarray:
+    vec = np.zeros(size)
+    vec[index] = 1.0
+    return vec
+
+
 class PomdpEnv():
     """
-    Base class for POMDP environments.
+    Base class for POMDP environments with discrete state and observation spaces.
+    Contains methods for calculating value and Q-value functions, updating state, yielding observations and rewards, and updating belief states.
     """
     def __init__(self):
-        raise NotImplementedError("This is a base class. Please implement the methods in a subclass.")
+        raise NotImplementedError("This is a base class. Please implement a dedicated method in a subclass.")
+    
+    def get_value_function(self, policy):
+        """
+        Calculate the value function under a given policy on the !latent! state space.
+        """
+        # Get the marginal transition probability matrix under the policy
+        P_pi = np.einsum('sa, asn -> sn', policy, self.tp_matrix)
+      
+        # Get the reward vector under the policy using V = (I - P_pi)^-1 @ R
+        I = np.eye(self.state_dim)
+        V_pi = np.linalg.solve(I - self.gamma*P_pi, self.reward_vec)
 
-    def reset(self):
-        raise NotImplementedError("Reset method must be implemented in the subclass.")
+        return np.round(V_pi, 2)
+    
+    def get_q_value_function(self, policy):
+        """
+        Calculate the Q-value function under a given policy on the !latent! state space.
+        """
+        # Get value function under the policy
+        V_pi = self.get_value_function(policy)
 
-    def step(self, action):
-        raise NotImplementedError("Step method must be implemented in the subclass.")
+        # Calculate Q-values via Q(s, a) = R(s) + sum_{s'} P(s'|s, a) V(s')
+        Q_pi = np.zeros((self.state_dim, 4))
+        Q_pi += self.reward_vec[:, None]
+        Q_pi += self.gamma*np.einsum('asn, n -> sa', self.tp_matrix, V_pi)
 
-    def render(self):
-        raise NotImplementedError("Render method must be implemented in the subclass.")
+        return np.round(Q_pi, 2)
+    
+    def update_state(self, prev_state: np.ndarray, action_i:int) -> int:
+        """
+        Update state via s_t ~ p(s_t | s_{t-1}, a_{t-1})
+        """
+        state_probs = prev_state @ self.tp_matrix[action_i]
+        state_index = np.random.choice(self.state_dim, p=state_probs)
+
+        return state_index
+
+    def yield_observation(self, state_i:int) -> int:
+        """
+        Observation index is given by o_t ~ p(o_t | s_t)
+        """
+        obs_probs   = self.obs_matrix[state_i]
+        obs_index   = np.random.choice(self.obs_dim, p=obs_probs)
+        
+        return obs_index
+    
+    def yield_reward(self, state_i:int) -> float:
+        """
+        Reward is a scalar value associated with the state.
+        """
+        return self.reward_vec[state_i]
+    
+    def update_belief(self, prev_belief_state: np.ndarray, obs_i:int, action: int) -> np.ndarray:
+        """
+        Belief update is via:
+         p(x_t|b_t) \propto p(o_t | s_t) \sum_{s_{t-1}} p(s_t | s_{t-1}, a_{t-1}) p(x_{t-1}|b_{t-1})
+        """        
+        belief_state = prev_belief_state @ self.tp_matrix[action]
+        belief_state *= self.obs_matrix[:, obs_i]
+        belief_state /= np.sum(belief_state)
+        
+        return belief_state
+    
+    def interact(self, prev_state, prev_belief, action_i:int) -> tuple[int, float, int, np.ndarray]:
+        """
+        Take a step in the environment with the given action.
+        """
+        new_state_i = self.update_state(prev_state, action_i)
+        reward      = self.yield_reward(new_state_i)
+        obs_i       = self.yield_observation(new_state_i)
+        new_belief  = self.update_belief(prev_belief, obs_i, action_i)
+        
+        return new_state_i, obs_i, reward, new_belief
+    
+    def step(self, action_i:int):
+        raise NotImplementedError("This method should be implemented in a subclass.")
+
 
 class CliffWalk(PomdpEnv):
     """
@@ -25,9 +100,10 @@ class CliffWalk(PomdpEnv):
         self.n = n # Number of rows
         self.m = m # Number of columns
         self.state_dim = n * m # Total number of states
+        
         self.self_transition_prob = self_transition_prob # Probability of staying in the same state
         self.action_space = [0, 1, 2, 3] # left, up, right, down
-        self.gamma = gamma
+        self.gamma = gamma # Discount factor
 
         self.generic_reward = -1.0
         self.cliff_reward   = -10.0
@@ -45,7 +121,7 @@ class CliffWalk(PomdpEnv):
 
         self.reset()
 
-    def init_tp_matrix(self):
+    def init_tp_matrix(self) -> np.ndarray:
         """
         Transition Probability Matrix (TPM) for the environment.
         the TPM is a 3D tensor of size [|actions|, |states|, |states|]
@@ -76,44 +152,44 @@ class CliffWalk(PomdpEnv):
 
                         target_state_index = x_new + y_new * self.m
                         # add probability of moving to the target state
-                        tpm[action, current_state_index, target_state_index] += (1 - self.self_transition_prob)
+                        tpm[action, current_state_index, target_state_index]    += (1 - self.self_transition_prob)
                         # add probability of staying in the same state
-                        tpm[action, current_state_index, current_state_index] += self.self_transition_prob
+                        tpm[action, current_state_index, current_state_index]   += self.self_transition_prob
 
         return tpm
 
-    def init_reward_vec(self):
+    def init_reward_vec(self) -> np.ndarray:
         """
-        Reward vector for the environment. size is [|states|]
-        The reward is -1 for all states except the goal state (0, m-1) which has a reward of 0.
-        and the cliff states which have a reward of -100.
+        Reward vector for the environment. size is [|states|].
         """
-        reward_vec = np.full((self.state_dim), self.generic_reward)
+        reward_vec = np.full((self.state_dim), self.generic_reward) # Default reward is generic reward
         for x in range(self.m):
             for y in range(self.n):
                 if (x == self.m - 1 and y == 0):
-                    reward_vec[x + y * self.m] = self.target_reward
+                    reward_vec[x + y * self.m] = self.target_reward # Goal state
                 elif y == 0 and x > 0 and x < self.m - 1:
-                    reward_vec[x + y * self.m] = self.cliff_reward
+                    reward_vec[x + y * self.m] = self.cliff_reward  # Cliff states
         
         return reward_vec
 
-    def init_observation_matrix(self):
+    def init_observation_matrix(self) -> np.ndarray:
         """
-        Observation matrix for the environment. size is [|states|, |observations|]
-        start and end states are revealed as seperate observations, 
-        otherwise only vertical position is revealed.
+        Observation matrix for the environment. size is [|states|, |observations|].
+        Start and end states are revealed as seperate observations [0, 1], otherwise only vertical position is revealed.
         """
         obs_matrix = np.zeros((self.state_dim, self.n+2))
         for x in range(self.m):
             for y in range(self.n):
                 current_state_index = x + y * self.m
+                
                 # Start state has unique observation
                 if x == 0 and y == 0:
                     obs_matrix[current_state_index, 0] = 1.0
+                
                 # Goal state has unique observation
                 elif y == 0 and x == self.m - 1:
                     obs_matrix[current_state_index, 1] = 1.0
+                
                 # Otherwise, only vertical position is revealed
                 else:
                     obs_matrix[current_state_index, y + 2] = 1.0
@@ -135,15 +211,19 @@ class CliffWalk(PomdpEnv):
         for x in range(self.m):
             for y in range(self.n):
                 current_state_index = x + y * self.m
+                
                 # Start state, move up
                 if x == 0 and y == 0:
                     pi[current_state_index, 1] = 1.0
+                
                 # Any non-cliff state, not at the right edge, move right
                 elif y > 0 and x < self.m - 1:
                     pi[current_state_index, 2] = 1.0
+                
                 # in terminal states (cliff and goal) all actions are equally likely
                 elif y == 0 and x > 0:
                     pi[current_state_index, :] = 0.25
+                
                 # right edge, move down
                 else:
                     pi[current_state_index, 3] = 1.0
@@ -155,86 +235,53 @@ class CliffWalk(PomdpEnv):
         
         return pi
 
-    def get_value_function(self, policy):
+    def check_done(self):
         """
-        Calculate the value function under a given policy on the latent state space.
+        Check if the current state is a terminal state.
         """
-        # Get the marginal transition probability matrix under the policy
-        P_pi = np.einsum('sa, asn -> sn', policy, self.tp_matrix)
-      
-        # Get the reward vector under the policy using V = (I - P_pi)^-1 @ R
-        I = np.eye(self.state_dim)
-        V_pi = np.linalg.solve(I - self.gamma*P_pi, self.reward_vec)
-
-        return np.round(V_pi, 2)
-    
-    def get_q_value_function(self, policy):
-        """
-        Calculate the Q-value function under a given policy on the latent state space.
-        """
-        # Get value function under the policy
-        V_pi = self.get_value_function(policy)
-
-        # Calculate Q-values via Q(s, a) = R(s) + sum_{s'} P(s'|s, a) V(s')
-        Q_pi = np.zeros((self.state_dim, 4))
-        Q_pi += self.reward_vec[:, None]
-        Q_pi += self.gamma*np.einsum('asn, n -> sa', self.tp_matrix, V_pi)
-
-        return np.round(Q_pi, 2)
+        # Terminal states are the cliff and the goal state
+        if np.argmax(self.state) in list(range(1, self.m)):
+            self.done = True
 
     def reset(self):
+        """
+        Reset the environment to the initial state.
+        """
         self.done = False
 
         # Reset state to the start position (0, 0)
-        self.state = np.zeros(self.state_dim)
-        self.state[0] = 1
+        self.state = onehot(self.state_dim, 0)
         
         # Observation is the unique start position
-        observation = np.zeros(self.obs_dim)
-        observation[0] = 1
+        observation = onehot(self.obs_dim, 0)
 
-        # Reward is -0.1 at the start position
+        # Reward generic at the start position
         reward = self.generic_reward
 
-        # Initialize the fully resolved belief state at the start position
-        self.belief_state = np.zeros(self.state_dim)
-        self.belief_state[0] = 1
+        # Initialize the fully resolved belief state at the start position (due to the revealing observation)
+        self.belief_state = onehot(self.state_dim, 0)
         
         return self.state, observation, reward, self.belief_state, self.done
-    
 
-    def step(self, action):
+    def step(self, action_i:int) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, bool]:
+        """
+        Take a step in the environment with the given action.
+        """
         if self.done:
-            raise ValueError("Episode is done. Please reset the environment.")
+            raise RuntimeError("Episode has reached termination state. Please reset env before taking a step.")
         
-        # Update state via s_t ~ p(s_t | s_{t-1}, a_{t-1})
-        state_probs = self.state @ self.tp_matrix[action]
-        state_index = np.random.choice(self.state_dim, p=state_probs)
-        state       = np.zeros(self.state_dim)
-        state[state_index] = 1
+        # Update state, reward, observation, and belief state
+        new_state_i, obs_i, reward, new_belief = self.interact(self.state, self.belief_state, action_i)
         
-        # Reward is a scalar value s_t @ r_t
-        reward      = self.reward_vec @ state
-        
-        # Observation index is given by o_t ~ p(o_t | s_t)
-        obs_probs   = self.obs_matrix[state_index]
-        obs_index   = np.random.choice(self.obs_dim, p=obs_probs)
-        observation = np.zeros(self.obs_dim)
-        observation[obs_index] = 1
-
-        # Belief update is via p(x_t|b_t) \propto p(o_t | s_t) \sum_{s_{t-1}} p(s_t | s_{t-1}, a_{t-1}) p(x_{t-1}|b_{t-1})
-        belief_state = self.belief_state @ self.tp_matrix[action]
-        belief_state *= self.obs_matrix[:, obs_index]
-        belief_state /= np.sum(belief_state)
-        self.belief_state = belief_state
+        self.state  = onehot(self.state_dim, new_state_i)
+        self.belief_state = new_belief
+        observation = onehot(self.obs_dim, obs_i)
 
         # Check if the episode is done
-        if reward == self.target_reward or reward == self.cliff_reward:
-            self.done = True
-        self.state = state
-        
-        return state, observation, reward, belief_state, self.done
-    
+        self.check_done()
+
+        return self.state, observation, reward, self.belief_state, self.done
+
     def render(self):
         """
         Render the environement"
@@ -255,175 +302,3 @@ class CliffWalk(PomdpEnv):
         plt.show()
 
 
-class Episode():
-    """
-    Class for handling data from a POMDP episode
-    """
-    def __init__(self):
-        self.states = []
-        self.observations = []
-        self.rewards = []
-        self.actions = []
-        self.belief_states = []
-
-        self.attached = False
-        
-    def add_step(self, state, observation, reward, action, belief_state):
-        """
-        Add a step to the episode data
-
-        :param state: Current state of the environment, one-hot encoded numpy vector
-        :param observation: Current observation of the environment, one-hot encoded numpy vector
-        :param reward: Reward received from the environment, scalar
-        :param action: Action taken in the environment, one-hot encoded numpy vector
-        :param belief_state: Current belief state of the environment, vector of probabilities
-        """
-        self.states.append(state)
-        self.observations.append(observation)
-        self.rewards.append(reward)
-        self.actions.append(action)
-        self.belief_states.append(belief_state)
-
-    def finish_episode(self):
-        """
-        Finish the episode and attach the data
-        """
-        self.attach()
-
-    def attach(self):
-        """
-        Turn the lists into numpy arrays for easier handling
-        """
-        if not self.attached:
-            self.states         = np.array(self.states)
-            self.observations   = np.array(self.observations)
-            self.rewards        = np.array(self.rewards)    
-            self.actions        = np.array(self.actions)
-        
-            # Create a history from column-concatenating the observations and actions
-            self.history        = np.concatenate((self.observations, self.actions), axis=1)
-            self.belief_states  = np.array(self.belief_states)
-           
-            self.attached = True
-
-    def render(self):
-        """
-        Render the episode data
-        """
-        self.attach()
-        
-        fig, axs = plt.subplots(5, 1, figsize=(8, 10))
-        
-        # Render the states
-        axs[0].imshow(self.states.T, aspect='auto', cmap='gray')
-        axs[0].set_title("States")
-        axs[0].set_xlabel("Time Step")
-        axs[0].set_ylabel("State Index")
-
-        # Render the observations
-        axs[1].imshow(self.observations.T, aspect='auto', cmap='gray')
-        axs[1].set_title("Observations")
-        axs[1].set_xlabel("Time Step")
-        axs[1].set_ylabel("Observation Index")
-
-        # Render the actions
-        axs[2].imshow(self.actions.T, aspect='auto', cmap='gray')
-        axs[2].set_title("Actions")
-        axs[2].set_xlabel("Time Step")
-        axs[2].set_ylabel("Action Index")
-
-        # Render the rewards
-        axs[3].plot(self.rewards, marker='o', linestyle='-', color='b')
-        axs[3].set_title("Rewards")
-        axs[3].set_xlabel("Time Step")
-
-        # Render the belief states
-        axs[4].imshow(self.belief_states.T, aspect='auto', cmap='gray')
-        axs[4].set_title("Belief States")
-        axs[4].set_xlabel("Time Step")
-        axs[4].set_ylabel("State Index")
-        
-        plt.tight_layout()
-        plt.show()
-
-
-def collect_episodes(env:PomdpEnv, policy:np.array, num_episodes:int) -> list[Episode]:
-    """
-    Collect episodes from the environment using a given policy.
-    Args:
-        env:            The environment to collect episodes from.
-        policy:         A callable that takes the current state and returns an action.
-        num_episodes:   Number of episodes to collect.
-    Returns:
-        A list of "Episode" objects.
-    """
-    episodes = []
-    for _ in range(num_episodes):
-        # Initialize a new episode
-        episode = Episode()
-
-        # Reset the environment, and emit the first data points
-        state, observation, reward, belief, done = env.reset()
-        prev_action = np.zeros(len(env.action_space))  # No action taken yet
-        
-        while not done:
-            # Add step to the episode
-            episode.add_step(state, observation, reward, prev_action, belief)
-            
-            # Sample state for the policy from the belief state, and act as if in that state
-            act_as_if_state = np.random.choice(env.n * env.m, p=belief)
-            action = np.random.choice(env.action_space, p=policy[act_as_if_state])
-            prev_action = np.zeros(len(env.action_space))
-            prev_action[action] = 1
-            
-            # Step the environment with the chosen action
-            state, observation, reward, belief, done = env.step(action)
-
-        # update the episode with the final states, finish, and append it to the list
-        episode.add_step(state, observation, reward, prev_action, belief)
-        episode.finish_episode()
-        episodes.append(episode)
-    
-    return episodes  
-        
-def monte_carlo_state_values(episodes: list[Episode], gamma=0.9):
-    """
-    Monte Carlo estimation of V(s) for one-hot discrete states.
-
-    Args:
-        episodes:       list of "Episode" objects
-        gamma:          discount factor
-
-    Returns:
-        state_values:   array of shape (num_states,) with estimated V(s)
-    """
-    assert len(episodes) > 0, "No episodes provided for Monte Carlo estimation."
-    assert isinstance(episodes, list), "Episodes must be a list of Episode objects."
-    assert all(isinstance(ep, Episode) for ep in episodes), "All items in the list must be Episode objects."
-    assert all(ep.attached for ep in episodes), "All episodes must be attached (data converted to numpy arrays)."
-
-    num_states = episodes[0].states.shape[1]
-    state_returns = np.zeros(num_states)
-    state_counts = np.zeros(num_states)
-
-    for ep in episodes:
-        rewards = ep.rewards
-        states = ep.states
-
-        G = 0.0
-        returns = [0.0] * len(rewards)
-        for t in reversed(range(len(rewards))):
-            G = rewards[t] + gamma * G
-            returns[t] = G
-
-        for t, state in enumerate(states):
-            state_idx = np.argmax(state).item()  # Get index from one-hot
-            state_returns[state_idx] += returns[t]
-            state_counts[state_idx] += 1
-
-    # Avoid divide-by-zero
-    nonzero_mask = state_counts > 0
-    state_values = np.zeros(num_states)
-    state_values[nonzero_mask] = state_returns[nonzero_mask] / state_counts[nonzero_mask]
-
-    return np.round(state_values, 2)
