@@ -125,7 +125,7 @@ def plot_decoded_belief(value_model, belief_model, test_episode, cliff_dim = (3,
     beliefs = np.round(beliefs, 2)[0]
 
     for t in range(len(true_beliefs)):
-        fig, axs = plt.subplots(1, 3, figsize=(6, 3))
+        fig, axs = plt.subplots(1, 3, figsize=(8, 4))
         # true beliefs
         axs[0].imshow(true_beliefs[t].reshape(cliff_dim), cmap='viridis', interpolation='nearest', vmin=0, vmax=1)
         axs[0].set_title(f"True Beliefs at t={t}")
