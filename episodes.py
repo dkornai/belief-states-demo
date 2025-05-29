@@ -95,6 +95,119 @@ class Episode():
         plt.tight_layout()
         plt.show()
 
+class EpisodeCollection():
+    """
+    Class for handling data from a collection of episodes
+    """
+    def __init__(self, episodes):
+        
+        assert isinstance(episodes, list), "Episodes must be provided as a list."
+        assert len(episodes) > 0, "The list of episodes cannot be empty."
+        assert all(isinstance(ep, Episode) for ep in episodes), "All items in the list must be Episode objects."
+        assert all(ep.attached for ep in episodes), "All episodes must be attached (data converted to numpy arrays)."
+        self.episodes = episodes
+
+        # Pre-convert episodes to padded tensors for training
+        self.episodes_to_batch()
+        
+        self.B = len(self.episodes)                         # Number of episodes
+        self.T = self.batch_histories.shape[1]              # Length of the longest episode in the batch
+        self.O = self.episodes[0].observations.shape[1]     # Observation dimension
+        self.A = self.episodes[0].actions.shape[1]          # Number of distinct actions
+        self.H = self.batch_histories.shape[2]              # History dimension (O + A)
+
+    def get_monte_carlo_values(self, gamma=None):
+        """
+        Monte Carlo estimation of V(s) from the list of episodes
+        """
+        assert gamma is not None, "Gamma (discount factor) must be provided."
+        assert gamma >= 0 and gamma <= 1, "Gamma must be in the range [0, 1]."
+        assert len(self.episodes) > 100, "Not enough episodes provided for Monte Carlo estimation."
+        
+        num_states = self.episodes[0].states.shape[1]
+        state_returns = np.zeros(num_states)
+        state_counts = np.zeros(num_states)
+
+        for ep in self.episodes:
+            rewards = ep.rewards
+            states = ep.states
+
+            G = 0.0
+            returns = [0.0] * len(rewards)
+            for t in reversed(range(len(rewards))):
+                G = rewards[t] + gamma * G
+                returns[t] = G
+
+            for t, state in enumerate(states):
+                state_idx = np.argmax(state).item()  # Get index from one-hot
+                state_returns[state_idx] += returns[t]
+                state_counts[state_idx] += 1
+
+        # Avoid divide-by-zero
+        nonzero_mask = state_counts > 0
+        state_values = np.zeros(num_states)
+        state_values[nonzero_mask] = state_returns[nonzero_mask] / state_counts[nonzero_mask]
+
+        self.mc_values = np.round(state_values, 2)
+        return self.mc_values
+    
+    def get_monte_carlo_returns(self, gamma=None):
+        """
+        Calculate the Monte Carlo returns for each episode.
+        """
+        assert gamma is not None, "Gamma (discount factor) must be provided."
+        assert gamma >= 0 and gamma <= 1, "Gamma must be in the range [0, 1]."
+
+        returns = torch.zeros_like(self.batch_rewards)
+        for b in range(self.B):
+            G = 0.0
+            for t in reversed(range(self.T)):
+                if self.batch_mask_traj[b, t] == 1.0:
+                    G = self.batch_rewards[b, t] + gamma * G
+                    returns[b, t] = G
+        
+        self.mc_returns = returns
+        return self.mc_returns
+
+    def episodes_to_batch(self):
+        """
+        Convert a list of episodes into padded tensors of equal length for training.
+        """
+        # Extract data from episodes
+        histories   = [torch.tensor(ep.history, dtype=torch.float32) for ep in self.episodes]
+        rewards     = [torch.tensor(ep.rewards, dtype=torch.float32) for ep in self.episodes]
+        beliefs     = [torch.tensor(ep.belief_states, dtype=torch.float32) for ep in self.episodes]
+        lengths     = [len(r) for r in rewards]
+        
+        # Pad sequences to create a batch
+        padded_histories    = pad_sequence(histories,   batch_first=True) # [B, T, O+A]
+        padded_rewards      = pad_sequence(rewards,     batch_first=True) # [B, T]
+        padded_beliefs      = pad_sequence(beliefs,     batch_first=True) # [B, T, S]
+
+        # Mask for valid time steps within each episode [size (B, T)]
+        mask_traj   = torch.zeros_like(padded_rewards, dtype=torch.float32)
+        for i, length in enumerate(lengths):
+            mask_traj[i, :length] = 1.0
+
+        # Composite mask for start and terminal states [size (B, T)]
+        mask_monte_carlo = torch.zeros_like(padded_rewards, dtype=torch.float32)
+        for i, length in enumerate(lengths):
+            mask_monte_carlo[i, length-1] = 1.0  
+            mask_monte_carlo[i, 0] = 1.0
+        mask_monte_carlo = mask_monte_carlo.clamp(0, 1)
+
+
+        self.ep_lengths         = lengths
+        self.batch_histories    = padded_histories
+        self.batch_rewards      = padded_rewards
+        self.batch_beliefs      = padded_beliefs
+        self.batch_mask_traj    = mask_traj
+        self.batch_mask_mc      = mask_monte_carlo
+    
+    def __len__(self):
+        return self.B
+        
+
 
 def collect_episodes(env:PomdpEnv, policy:np.array, num_episodes:int) -> list[Episode]:
     """
@@ -138,115 +251,6 @@ def collect_episodes(env:PomdpEnv, policy:np.array, num_episodes:int) -> list[Ep
     
     return episodes  
         
-def monte_carlo_state_values(episodes: list[Episode], gamma=0.9):
-    """
-    Monte Carlo estimation of V(s) from a list of episodes.
-
-    Args:
-        episodes:       list of "Episode" objects
-        gamma:          discount factor
-
-    Returns:
-        state_values:   array of shape (num_states,) with estimated V(s)
-    """
-    assert len(episodes) > 100, "Not enough episodes provided for Monte Carlo estimation."
-    assert isinstance(episodes, list), "Episodes must be a list of Episode objects."
-    assert all(isinstance(ep, Episode) for ep in episodes), "All items in the list must be Episode objects."
-    assert all(ep.attached for ep in episodes), "All episodes must be attached (data converted to numpy arrays)."
-
-    num_states = episodes[0].states.shape[1]
-    state_returns = np.zeros(num_states)
-    state_counts = np.zeros(num_states)
-
-    for ep in episodes:
-        rewards = ep.rewards
-        states = ep.states
-
-        G = 0.0
-        returns = [0.0] * len(rewards)
-        for t in reversed(range(len(rewards))):
-            G = rewards[t] + gamma * G
-            returns[t] = G
-
-        for t, state in enumerate(states):
-            state_idx = np.argmax(state).item()  # Get index from one-hot
-            state_returns[state_idx] += returns[t]
-            state_counts[state_idx] += 1
-
-    # Avoid divide-by-zero
-    nonzero_mask = state_counts > 0
-    state_values = np.zeros(num_states)
-    state_values[nonzero_mask] = state_returns[nonzero_mask] / state_counts[nonzero_mask]
-
-    return np.round(state_values, 2)
 
 
-def episodes_to_batch(episodes: list[Episode]) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert a list of episodes into padded tensors of equal length for training.
-    """
-    # Extract data from episodes
-    histories   = [torch.tensor(ep.history, dtype=torch.float32) for ep in episodes]
-    rewards     = [torch.tensor(ep.rewards, dtype=torch.float32) for ep in episodes]
-    
-    # Pad sequences to create a batch
-    padded_histories    = pad_sequence(histories,   batch_first=True)
-    padded_rewards      = pad_sequence(rewards,     batch_first=True)
 
-    return padded_histories, padded_rewards
-
-def beliefs_to_batch(episodes: list[Episode]) -> torch.Tensor:
-    """
-    Convert a list of episodes into padded tensors of belief states for training.
-    """
-    # Extract belief states from episodes
-    beliefs = [torch.tensor(ep.belief_states, dtype=torch.float32) for ep in episodes]
-    
-    # Pad sequences to create a batch
-    padded_beliefs = pad_sequence(beliefs, batch_first=True)
-
-    return padded_beliefs
-
-def episodes_to_masks(episodes: list[Episode]) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """
-    Convert a list of episodes into the masks used for various training objectives.
-    """
-    rewards     = [torch.tensor(ep.rewards, dtype=torch.float32) for ep in episodes]
-    padded_rewards      = pad_sequence(rewards,     batch_first=True)
-    lengths     = [len(r) for r in rewards]
-    
-    # Mask for valid time steps within each episode
-    mask_traj   = torch.zeros_like(padded_rewards, dtype=torch.float32)
-    for i, length in enumerate(lengths):
-        mask_traj[i, :length] = 1.0
-
-    # Mask for terminal states
-    mask_end   = torch.zeros_like(padded_rewards, dtype=torch.float32)
-    for i, length in enumerate(lengths):
-        mask_end[i, length-1] = 1.0  
-
-    # Mask for start states
-    mask_start = torch.zeros_like(padded_rewards, dtype=torch.float32)
-    for i in range(len(episodes)):
-        mask_start[i, 0] = 1.0  # Always first state
-
-    # Composite mask for start and terminal states
-    mask_monte_carlo = (mask_start + mask_end).clamp(0, 1)
-
-    return mask_traj, mask_monte_carlo, lengths
-
-def extract_monte_carlo_returns(padded_rewards, mask_traj, gamma=1.0) -> torch.Tensor:
-    """
-    Calculate the Monte Carlo returns for each episode in the batch.
-    """
-    B, T = padded_rewards.shape
-    returns = torch.zeros_like(padded_rewards)
-    for b in range(B):
-        G = 0.0
-        for t in reversed(range(T)):
-            if mask_traj[b, t] == 1.0:
-                G = padded_rewards[b, t] + gamma * G
-                returns[b, t] = G
-
-    
-    return returns
